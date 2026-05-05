@@ -451,5 +451,5 @@ export class LidResolver {
     this.#sock.ev.off("groups.update", this.#groupsUpsertHandler);
     this.#joinCallbacks = [];
   }
-      }
+}
       
