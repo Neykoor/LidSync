@@ -41,9 +41,6 @@ export class LidResolver {
   #sincronizado = false;
   #joinCallbacks = [];
 
-  // LIDs pendientes de resolver para onJoin: lid -> { groupId, timeoutId }
-  #pendingJoins = new Map();
-
   constructor(sock, options = {}) {
     this.#sock = sock;
     this.#store = options.store || null;
@@ -95,16 +92,6 @@ export class LidResolver {
         this.#cache.set(lid, jidLimpio);
         this.#limpiarExcesoIndice();
         this.#guardarEnSignalRepository([{ lid, pn: jidLimpio }]);
-
-        // Si este LID estaba esperando para disparar onJoin, hacerlo ahora
-        if (this.#pendingJoins.has(lid)) {
-          const { groupId, timeoutId } = this.#pendingJoins.get(lid);
-          clearTimeout(timeoutId);
-          this.#pendingJoins.delete(lid);
-          if (this.#joinCallbacks.length > 0) {
-            this.#dispararOnJoin({ groupId, lid, jid: jidLimpio });
-          }
-        }
       }
     };
 
@@ -138,8 +125,6 @@ export class LidResolver {
         }
       }
 
-      const joinedJids = [];
-
       if (Array.isArray(participants)) {
         for (const p of participants) {
           if (p.lid && p.phoneNumber) {
@@ -148,39 +133,6 @@ export class LidResolver {
               this.#reverseIndex.set(p.lid, jidLimpio);
               this.#cache.set(p.lid, jidLimpio);
               nuevosPares.push({ lid: p.lid, pn: jidLimpio });
-              if (action === "add" || action === "promote") {
-                joinedJids.push({ lid: p.lid, jid: jidLimpio });
-              }
-            }
-          } else if (esLid(p.id || p.lid)) {
-            const lid = p.lid || p.id;
-            if (!this.#reverseIndex.has(lid) && !this.#cache.has(lid)) {
-              if (action === "add") {
-                // Intentar resolver inmediatamente; si falla, registrar para reintento
-                this.resolver(lid).then((jid) => {
-                  if (jid) {
-                    if (this.#joinCallbacks.length > 0) {
-                      this.#dispararOnJoin({ groupId, lid, jid });
-                    }
-                  } else {
-                    // No se resolvió aún — esperar hasta 20s a que llegue el mapping
-                    this.#registrarPendingJoin(lid, groupId);
-                  }
-                }).catch(() => {
-                  this.#registrarPendingJoin(lid, groupId);
-                });
-              } else {
-                this.resolver(lid).catch(() => {});
-              }
-            } else if (action === "add") {
-              const jid = this.#reverseIndex.get(lid) || this.#cache.get(lid);
-              if (jid) joinedJids.push({ lid, jid });
-            }
-          } else if (!esLid(p.id)) {
-            // Participante con JID normal (sin LID)
-            const jidLimpio = limpiarJid(p.id || p);
-            if (jidLimpio && action === "add") {
-              joinedJids.push({ lid: null, jid: jidLimpio });
             }
           }
         }
@@ -191,20 +143,20 @@ export class LidResolver {
         this.#guardarEnSignalRepository(nuevosPares);
       }
 
-      // Disparar callbacks de bienvenida para todos los que se unieron
-      if (joinedJids.length > 0 && this.#joinCallbacks.length > 0) {
-        for (const { lid, jid } of joinedJids) {
-          this.#dispararOnJoin({ groupId, lid, jid });
-        }
+      if (action === "add" && this.#joinCallbacks.length > 0) {
+        this.resolverParticipantes(participants).then((resolvedMap) => {
+          for (const p of participants) {
+            const lid = p.lid || (typeof p.id === "string" && p.id.endsWith("@lid") ? p.id : null);
+            const jidRaw = p.phoneNumber ? `${p.phoneNumber}@s.whatsapp.net` : p.id;
+            const jidFinal = resolvedMap.get(lid || p.id) || limpiarJid(jidRaw) || jidRaw;
+
+            this.#dispararOnJoin({ groupId, lid, jid: jidFinal });
+          }
+        }).catch(() => {});
       }
     };
 
-    this.#groupJoinRequestHandler = ({
-      author,
-      authorPn,
-      participant,
-      participantPn,
-    }) => {
+    this.#groupJoinRequestHandler = ({ author, authorPn, participant, participantPn }) => {
       const nuevosPares = [];
       if (author && authorPn) {
         const jid = limpiarJid(authorPn);
@@ -264,25 +216,6 @@ export class LidResolver {
     this.#suscribirAEventos();
   }
 
-  // Registra un LID que se unió pero aún no tiene número resuelto.
-  // Cuando llegue el mapping vía lid-mapping.update, se dispara onJoin.
-  // Si en 20s no llega, se abandona con un warning.
-  #registrarPendingJoin(lid, groupId) {
-    if (this.#pendingJoins.has(lid)) return; // ya registrado
-
-    const TIMEOUT_MS = 20_000;
-    const timeoutId = setTimeout(() => {
-      if (this.#pendingJoins.has(lid)) {
-        this.#pendingJoins.delete(lid);
-        console.warn(`[LidSync] onJoin: LID no resuelto tras ${TIMEOUT_MS / 1000}s, omitido: ${lid}`);
-      }
-    }, TIMEOUT_MS);
-
-    if (timeoutId.unref) timeoutId.unref();
-
-    this.#pendingJoins.set(lid, { groupId, timeoutId });
-  }
-
   #suscribirAEventos() {
     this.#sock.ev.on("contacts.upsert", this.#handler);
     this.#sock.ev.on("contacts.update", this.#handler);
@@ -319,7 +252,7 @@ export class LidResolver {
         if (jidLimpio) {
           this.#reverseIndex.set(lid, jidLimpio);
           this.#cache.set(lid, jidLimpio);
-          nuevosPares.push({ lid, pn: jidLimpio });
+          nuevosPares.push({ lid, jidLimpio });
         }
       }
     }
@@ -372,7 +305,6 @@ export class LidResolver {
         maxSize: this.#maxIndexSize,
       },
       sincronizado: this.#sincronizado,
-      pendingJoins: this.#pendingJoins.size,
     };
   }
 
@@ -524,12 +456,6 @@ export class LidResolver {
   }
 
   destroy() {
-    // Limpiar todos los pending joins
-    for (const { timeoutId } of this.#pendingJoins.values()) {
-      clearTimeout(timeoutId);
-    }
-    this.#pendingJoins.clear();
-
     this.#cache.destroy();
     this.#reverseIndex.clear();
     this.#sock.ev.off("contacts.upsert", this.#handler);
@@ -544,5 +470,5 @@ export class LidResolver {
     this.#sock.ev.off("groups.update", this.#groupsUpsertHandler);
     this.#joinCallbacks = [];
   }
-          }
-          
+                                    }
+                            
