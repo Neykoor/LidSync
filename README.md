@@ -14,7 +14,7 @@
   <img src="https://img.shields.io/badge/license-MIT-yellow.svg?style=flat-square"/>
   <img src="https://img.shields.io/badge/Node.js-18%2B-green.svg?style=flat-square&logo=node.js"/>
   <img src="https://img.shields.io/badge/Baileys-%3E%3D6.7.0-purple.svg?style=flat-square"/>
-  <img src="https://img.shields.io/badge/status-stable-success.svg?style=flat-square"/>
+  <img src="https://img.shields.io/badge/estado-funciona%20✅-success.svg?style=flat-square"/>
 </p>
 
 ---
@@ -33,23 +33,15 @@ en lugar del número real. LidSync resuelve esos LIDs al JID real correspondient
 170360431460562@lid  →  521234567890@s.whatsapp.net
 ```
 
-LidSync no es un parche externo — sigue de cerca la arquitectura interna de Baileys. Usa el `signalRepository.lidMapping` que Baileys expone nativamente, se suscribe a los mismos eventos que Baileys emite (`lid-mapping.update`, `messaging-history.set`, `group-participants.update`, `group.join-request`, `group.member-tag.update`) y escribe de vuelta en el store de señal cuando aprende nuevos pares.
+LidSync no es un parche externo — sigue de cerca la arquitectura interna de Baileys. Usa el `signalRepository.lidMapping` que Baileys expone nativamente, se suscribe a los mismos eventos que Baileys emite y escribe de vuelta en el store de señal cuando aprende nuevos pares.
 
 ---
 
-## Cómo funciona
+## Estado
 
-LidSync resuelve mediante tres capas en cascada:
-
-| Nivel | Fuente | Detalle |
-|:---:|---|---|
-| **1** | Cache LRU | TTL de 24 h con refresco automático en cada lectura. Máx 7 500 entradas. |
-| **2** | Índice invertido | `Map<LID, JID>` en memoria, O(1). Se promueve al caché en cada consulta. |
-| **3** | Signal Repository | Fallback al `lidMapping` interno de Baileys y, si no hay resultado, al `pnToLIDFunc` vía USync. |
-
-El aprendizaje es completamente pasivo: cada mensaje, evento de contacto, actualización de grupo o acción de historial que Baileys emite es interceptado y procesado para enriquecer el índice automáticamente.
-
-> **Nota:** Un LID solo puede resolverse si el usuario ya interactuó con el bot o está en la agenda del número vinculado. Esto es una restricción de WhatsApp, no de LidSync.
+> ✅ **La librería funciona con la versión actual de Baileys.**
+>
+> LidSync se actualiza cuando Baileys cambia su implementación LID interna. Las actualizaciones normalmente siguen el ritmo de Baileys, aunque si un cambio crítico lo requiere, se lanza un parche de inmediato.
 
 ---
 
@@ -85,9 +77,7 @@ async function start() {
   // Inyectar LidSync — debe ir antes de store.bind()
   sock = pluginLid(sock, { store });
 
-  // Vincular el store a los eventos del socket
   store.bind(sock.ev);
-
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("messages.upsert", async ({ messages }) => {
@@ -108,6 +98,96 @@ start();
 
 ---
 
+## Ejemplo completo — Welcome con LID resuelto
+
+Este es el caso más común: enviar un mensaje de bienvenida cuando alguien entra a un grupo, resolviendo su LID al número real para mencionarlo correctamente.
+
+```js
+import {
+  makeWASocket,
+  useMultiFileAuthState,
+  makeInMemoryStore,
+  jidNormalizedUser,
+} from "@whiskeysockets/baileys";
+import { pluginLid } from "lidsync";
+import pino from "pino";
+
+const store = makeInMemoryStore({
+  logger: pino().child({ level: "silent", stream: "store" }),
+});
+
+store.readFromFile("./baileys_store.json");
+setInterval(() => store.writeToFile("./baileys_store.json"), 10_000);
+
+async function start() {
+  const { state, saveCreds } = await useMultiFileAuthState("./session");
+
+  let sock = makeWASocket({
+    auth: state,
+    printQRInTerminal: true,
+    logger: pino({ level: "silent" }),
+  });
+
+  // 1. Inyectar LidSync antes de store.bind()
+  sock = pluginLid(sock, { store });
+  store.bind(sock.ev);
+
+  sock.ev.on("creds.update", saveCreds);
+
+  sock.ev.on("connection.update", ({ connection }) => {
+    if (connection === "open") {
+      console.log("Bot conectado y LidSync activado.");
+      // Si el store carga datos desde disco, forzar sincronización aquí
+      sock.lid.syncStore();
+    }
+  });
+
+  // Welcome con resolución de LID
+  sock.ev.on("group-participants.update", async ({ id, participants, action }) => {
+    if (action !== "add") return;
+
+    // Resolver todos los LIDs del batch de una vez
+    const resolved = await sock.lid.resolveParticipants(participants);
+
+    for (const p of participants) {
+      const lid = p.lid || (p.id?.endsWith("@lid") ? p.id : null);
+      const jid = resolved.get(lid || p.id) || p.id;
+
+      await sock.sendMessage(id, {
+        text: `¡Bienvenido @${jid.split("@")[0]}! 👋`,
+        mentions: [jid],
+      });
+    }
+  });
+}
+
+start();
+```
+
+**¿Por qué usar `resolveParticipants` en el welcome?**
+
+Cuando varios usuarios entran al mismo tiempo, `resolveParticipants` resuelve el lote completo en una sola operación batch. Es más eficiente que llamar `resolve()` uno a uno y garantiza que la mención llegue con el JID real, no con el LID crudo.
+
+> **Nota:** Si el LID aún no tiene mapeo conocido, `resolved.get(...)` devuelve `undefined` y el fallback `|| p.id` usa el LID original. El mensaje se envía igual — WhatsApp lo entrega correctamente, aunque la mención visual puede quedar sin nombre en clientes muy nuevos.
+
+---
+
+## Cómo funciona
+
+LidSync resuelve mediante tres capas en cascada:
+
+| Nivel | Fuente | Detalle |
+|:---:|---|---|
+| **1** | Cache LRU | TTL de 24 h con refresco automático en cada lectura. Máx 7 500 entradas. |
+| **2** | Índice invertido | `Map<LID, JID>` en memoria, O(1). Se promueve al caché en cada consulta. |
+| **3** | Signal Repository | Fallback al `lidMapping` interno de Baileys. |
+
+El aprendizaje es completamente pasivo: cada mensaje, evento de contacto, actualización de grupo o historial que Baileys emite es interceptado y procesado para enriquecer el índice automáticamente.
+
+> **Nota:** Un LID solo puede resolverse si el usuario ya interactuó con el bot o está en la agenda del número vinculado. Esta es una restricción de WhatsApp, no de LidSync.
+
+---
+
 ## Vinculación con store personalizado
 
 Si usas un store propio (JSON, SQLite, etc.), pásalo en las opciones para que LidSync pueda aprender de los contactos y chats ya almacenados:
@@ -116,7 +196,7 @@ Si usas un store propio (JSON, SQLite, etc.), pásalo en las opciones para que L
 sock = pluginLid(sock, { store: miStore });
 ```
 
-El store debe exponer al menos `contacts` y/o `chats` como objetos planos con los contactos indexados por JID. Después de que la conexión abra, fuerza la sincronización si el store carga sus datos desde disco:
+El store debe exponer al menos `contacts` y/o `chats` como objetos planos. Después de que la conexión abra, fuerza la sincronización si el store carga sus datos desde disco:
 
 ```js
 sock.ev.on("connection.update", ({ connection }) => {
@@ -130,7 +210,7 @@ sock.ev.on("connection.update", ({ connection }) => {
 
 ### `sock.lid.resolve(id)`
 
-Resuelve un LID a su JID real. Si el input ya es un JID `@s.whatsapp.net`, lo devuelve normalizado directamente. Los sufijos de dispositivo (`:0`, `:1`, `:2`) se eliminan automáticamente de la salida.
+Resuelve un LID a su JID real. Si el input ya es un JID `@s.whatsapp.net`, lo devuelve normalizado directamente.
 
 ```js
 const jid = await sock.lid.resolve("170360431460562@lid");
@@ -146,7 +226,7 @@ const jid = await sock.lid.resolve("170360431460562@lid");
 
 ### `sock.lid.resolveBatch(ids, opciones?)`
 
-Resuelve múltiples LIDs con concurrencia controlada. Los que están en caché o índice se resuelven de inmediato sin bloquear.
+Resuelve múltiples LIDs con concurrencia controlada.
 
 ```js
 const resultado = await sock.lid.resolveBatch(
@@ -163,9 +243,22 @@ for (const [lid, jid] of resultado) {
 
 ---
 
+### `sock.lid.resolveParticipants(participants)`
+
+Resuelve los LIDs de un array de participantes de grupo en una sola operación batch. Es el método recomendado para el evento `group-participants.update`.
+
+```js
+const resolved = await sock.lid.resolveParticipants(participants);
+const jid = resolved.get(p.lid || p.id);
+```
+
+**Retorna:** `Map<string, string>`
+
+---
+
 ### `sock.lid.syncStore(forzar?)`
 
-Sincroniza el índice desde el store manualmente. Útil cuando el store carga datos desde disco después de que `pluginLid` ya fue inicializado.
+Sincroniza el índice desde el store manualmente.
 
 ```js
 sock.lid.syncStore();       // Solo si no se sincronizó antes
@@ -176,7 +269,7 @@ sock.lid.syncStore(true);   // Fuerza re-sincronización siempre
 
 ### `sock.lid.isResolvable(id)`
 
-Comprueba si un LID tiene mapeo conocido **sin hacer ninguna consulta**. Útil para decidir si vale la pena llamar a `resolve`.
+Comprueba si un LID tiene mapeo conocido sin hacer ninguna consulta externa.
 
 ```js
 if (sock.lid.isResolvable("170360431460562@lid")) {
@@ -190,12 +283,12 @@ if (sock.lid.isResolvable("170360431460562@lid")) {
 
 ### `sock.lid.preload(pares)`
 
-Pre-carga mapeos desde una fuente externa (base de datos, archivo) directamente al caché e índice.
+Pre-carga mapeos desde una fuente externa directamente al caché e índice.
 
 ```js
 sock.lid.preload([
   ["123456789@lid", "521234567890@s.whatsapp.net"],
-  ["987654321@lid", "521987654321@s.whatsapp.net"]
+  ["987654321@lid", "521987654321@s.whatsapp.net"],
 ]);
 
 // También acepta Map
@@ -224,7 +317,8 @@ const stats = sock.lid.getStats();
   },
   index: {
     size: 1250,
-    maxSize: 50000
+    maxSize: 50000,
+    ttlMs: 21600000
   },
   sincronizado: true
 }
@@ -235,7 +329,7 @@ const stats = sock.lid.getStats();
 
 ### `sock.lid.destroy()`
 
-Limpia el caché, vacía el índice y remueve todos los listeners del socket. Llámalo siempre antes de una reconexión para evitar listeners duplicados.
+Limpia el caché, vacía el índice y remueve todos los listeners. Llámalo siempre antes de una reconexión.
 
 ```js
 sock.lid.destroy();
@@ -246,8 +340,6 @@ sock = pluginLid(sock, { store });
 ---
 
 ## Eventos que LidSync escucha
-
-LidSync se suscribe a los eventos nativos de Baileys. No agrega overhead — aprovecha lo que Baileys ya emite:
 
 | Evento | Qué aprende |
 |---|---|
@@ -276,12 +368,21 @@ pluginLid(sock, { store })
 └── sock.lid
     ├── resolve(id)
     ├── resolveBatch(ids, opts?)
+    ├── resolveParticipants(participants)
     ├── syncStore(forzar?)
     ├── isResolvable(id)
     ├── preload(pares)
     ├── getStats()
     └── destroy()
 ```
+
+---
+
+## Política de actualizaciones
+
+LidSync se actualiza siguiendo el ritmo de Baileys. Cuando Baileys modifica su implementación interna del sistema LID, LidSync se adapta en consecuencia. Las actualizaciones pueden tardar algunos días si el cambio es menor, pero si un breaking change afecta el funcionamiento core, **se lanza un parche de inmediato**.
+
+Si encontrás que algo dejó de funcionar después de actualizar Baileys, abrí un issue indicando la versión de Baileys y el comportamiento observado.
 
 ---
 
