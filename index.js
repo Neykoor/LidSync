@@ -1,4 +1,5 @@
 import { LidResolver } from "./src/resolver.js";
+import { LidDatabase } from "./src/sqlite.js";
 
 export function pluginLid(sock, options = {}) {
   const resolver = new LidResolver(sock, options);
@@ -22,3 +23,4 @@ export function pluginLid(sock, options = {}) {
 }
 
 export { LidResolver } from "./src/resolver.js";
+export { LidDatabase } from "./src/sqlite.js";
