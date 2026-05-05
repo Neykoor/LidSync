@@ -23,6 +23,7 @@ export class LidResolver {
   #cache;
   #sock;
   #store;
+  #db;
   #reverseIndex = new Map();
   #handler;
   #msgHandler;
@@ -41,6 +42,7 @@ export class LidResolver {
   constructor(sock, options = {}) {
     this.#sock = sock;
     this.#store = options.store || null;
+    this.#db = options.db || null;
     this.#cache = new LidCache(options.cache || {});
     this.#maxIndexSize = Math.max(1000, options.maxIndexSize || 50000);
     this.#indexTtl = options.indexTtlMs ?? 21600000;
@@ -191,6 +193,13 @@ export class LidResolver {
       }
     };
 
+    if (this.#db) {
+      try {
+        const rows = this.#db.load();
+        if (rows.length) this.precargarCache(rows.map((r) => [r.lid, r.jid]));
+      } catch {}
+    }
+
     this.sincronizarDesdeStore();
     this.#suscribirAEventos();
   }
@@ -209,6 +218,7 @@ export class LidResolver {
   }
 
   #guardarEnSignalRepository(pares) {
+    try { this.#db?.save(pares); } catch {}
     this.#sock.signalRepository?.lidMapping?.storeLIDPNMappings?.(pares)?.catch(() => {});
   }
 
@@ -439,6 +449,7 @@ export class LidResolver {
     this.#purgeInterval = null;
     this.#cache.destroy();
     this.#reverseIndex.clear();
+    try { this.#db?.close(); } catch {}
     this.#sock.ev.off("contacts.upsert", this.#handler);
     this.#sock.ev.off("contacts.update", this.#handler);
     this.#sock.ev.off("messages.upsert", this.#msgHandler);
@@ -451,4 +462,5 @@ export class LidResolver {
     this.#sock.ev.off("groups.update", this.#groupsUpsertHandler);
     this.#joinCallbacks = [];
   }
-  }
+          }
+      
