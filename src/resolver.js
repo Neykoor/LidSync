@@ -38,6 +38,8 @@ export class LidResolver {
   #groupJoinRequestHandler;
   #groupMemberTagHandler;
   #maxIndexSize;
+  #indexTtl;
+  #purgeInterval = null;
   #sincronizado = false;
   #joinCallbacks = [];
 
@@ -46,6 +48,12 @@ export class LidResolver {
     this.#store = options.store || null;
     this.#cache = new LidCache(options.cache || {});
     this.#maxIndexSize = Math.max(1000, options.maxIndexSize || 50000);
+    this.#indexTtl = options.indexTtlMs ?? 1000 * 60 * 60 * 6; // 6h por defecto
+
+    // Purge periódico de inactivos (cada 30 min)
+    const purgeInterval = options.indexPurgeIntervalMs ?? 1000 * 60 * 30;
+    this.#purgeInterval = setInterval(() => this.#purgarInactivos(), purgeInterval);
+    if (this.#purgeInterval.unref) this.#purgeInterval.unref();
 
     this.#handler = (contactos) => this.#actualizarIndice(contactos);
 
@@ -68,7 +76,7 @@ export class LidResolver {
           if (lid && pn) {
             const jidLimpio = limpiarJid(pn);
             if (jidLimpio) {
-              this.#reverseIndex.set(lid, jidLimpio);
+              this.#setIndice(lid, jidLimpio);
               this.#cache.set(lid, jidLimpio);
               nuevosPares.push({ lid, pn: jidLimpio });
             }
@@ -88,7 +96,7 @@ export class LidResolver {
     this.#lidMappingHandler = ({ lid, pn }) => {
       const jidLimpio = limpiarJid(pn);
       if (lid && jidLimpio) {
-        this.#reverseIndex.set(lid, jidLimpio);
+        this.#setIndice(lid, jidLimpio);
         this.#cache.set(lid, jidLimpio);
         this.#limpiarExcesoIndice();
         this.#guardarEnSignalRepository([{ lid, pn: jidLimpio }]);
@@ -101,7 +109,7 @@ export class LidResolver {
       for (const { lid, pn } of lidPnMappings) {
         const jidLimpio = limpiarJid(pn);
         if (lid && jidLimpio) {
-          this.#reverseIndex.set(lid, jidLimpio);
+          this.#setIndice(lid, jidLimpio);
           this.#cache.set(lid, jidLimpio);
           nuevosPares.push({ lid, pn: jidLimpio });
         }
@@ -119,7 +127,7 @@ export class LidResolver {
         const lid = esLid(author) ? author : null;
         const jidLimpio = lid ? limpiarJid(authorPn) : null;
         if (lid && jidLimpio) {
-          this.#reverseIndex.set(lid, jidLimpio);
+          this.#setIndice(lid, jidLimpio);
           this.#cache.set(lid, jidLimpio);
           nuevosPares.push({ lid, pn: jidLimpio });
         }
@@ -130,7 +138,7 @@ export class LidResolver {
           if (p.lid && p.phoneNumber) {
             const jidLimpio = limpiarJid(p.phoneNumber);
             if (jidLimpio) {
-              this.#reverseIndex.set(p.lid, jidLimpio);
+              this.#setIndice(p.lid, jidLimpio);
               this.#cache.set(p.lid, jidLimpio);
               nuevosPares.push({ lid: p.lid, pn: jidLimpio });
             }
@@ -170,7 +178,7 @@ export class LidResolver {
 
       if (nuevosPares.length > 0) {
         for (const { lid, pn } of nuevosPares) {
-          this.#reverseIndex.set(lid, pn);
+          this.#setIndice(lid, pn);
           this.#cache.set(lid, pn);
         }
         this.#limpiarExcesoIndice();
@@ -197,7 +205,7 @@ export class LidResolver {
       const jidLimpio = limpiarJid(pn);
       if (!jidLimpio) return;
 
-      this.#reverseIndex.set(lid, jidLimpio);
+      this.#setIndice(lid, jidLimpio);
       this.#cache.set(lid, jidLimpio);
       this.#limpiarExcesoIndice();
       this.#guardarEnSignalRepository([{ lid, pn: jidLimpio }]);
@@ -250,7 +258,7 @@ export class LidResolver {
       if (lid && jidRaw) {
         const jidLimpio = limpiarJid(jidRaw);
         if (jidLimpio) {
-          this.#reverseIndex.set(lid, jidLimpio);
+          this.#setIndice(lid, jidLimpio);
           this.#cache.set(lid, jidLimpio);
           nuevosPares.push({ lid, jidLimpio });
         }
@@ -264,19 +272,48 @@ export class LidResolver {
   }
 
   #limpiarExcesoIndice() {
-    if (this.#reverseIndex.size >= this.#maxIndexSize) {
-      const toDelete = Math.floor(this.#maxIndexSize * 0.1);
-      let count = 0;
-      for (const key of this.#reverseIndex.keys()) {
-        if (count >= toDelete) break;
-        this.#reverseIndex.delete(key);
-        count++;
+    if (this.#reverseIndex.size < this.#maxIndexSize) return;
+    // Ordenar por lastSeen y borrar el 10% más inactivo
+    const toDelete = Math.floor(this.#maxIndexSize * 0.1);
+    const sorted = [...this.#reverseIndex.entries()]
+      .sort((a, b) => a[1].lastSeen - b[1].lastSeen);
+    for (let i = 0; i < toDelete && i < sorted.length; i++) {
+      this.#reverseIndex.delete(sorted[i][0]);
+    }
+  }
+
+  #purgarInactivos() {
+    if (this.#reverseIndex.size === 0) return;
+    const now = Date.now();
+    for (const [lid, entry] of this.#reverseIndex) {
+      if (now - entry.lastSeen > this.#indexTtl) {
+        this.#reverseIndex.delete(lid);
       }
     }
   }
 
+  #setIndice(lid, jid) {
+    const existing = this.#reverseIndex.get(lid);
+    this.#reverseIndex.set(lid, { jid, lastSeen: Date.now() });
+    // Solo reportar como nuevo si no existía antes
+    return !existing;
+  }
+
+  #getIndice(lid) {
+    const entry = this.#reverseIndex.get(lid);
+    if (!entry) return null;
+    // Verificar TTL
+    if (Date.now() - entry.lastSeen > this.#indexTtl) {
+      this.#reverseIndex.delete(lid);
+      return null;
+    }
+    // Actualizar lastSeen al consultar (LRU)
+    entry.lastSeen = Date.now();
+    return entry.jid;
+  }
+
   esResolvable(id) {
-    return esLid(id) && (this.#cache.has(id) || this.#reverseIndex.has(id));
+    return esLid(id) && (this.#cache.has(id) || this.#getIndice(id) !== null);
   }
 
   precargarCache(pares) {
@@ -285,7 +322,7 @@ export class LidResolver {
 
     for (const [lid, jid] of pares) {
       if (esLid(lid) && esJidResuelto(jid)) {
-        this.#reverseIndex.set(lid, jid);
+        this.#setIndice(lid, jid);
         this.#cache.set(lid, jid);
         nuevosPares.push({ lid, pn: jid });
       }
@@ -303,6 +340,7 @@ export class LidResolver {
       index: {
         size: this.#reverseIndex.size,
         maxSize: this.#maxIndexSize,
+        ttlMs: this.#indexTtl,
       },
       sincronizado: this.#sincronizado,
     };
@@ -347,7 +385,7 @@ export class LidResolver {
     const cached = this.#cache.get(id);
     if (cached) return cached;
 
-    const jid = this.#reverseIndex.get(id);
+    const jid = this.#getIndice(id);
     if (jid) {
       this.#cache.set(id, jid);
       return jid;
@@ -361,7 +399,7 @@ export class LidResolver {
           const jidReal = limpiarJid(pn);
           if (jidReal) {
             this.#limpiarExcesoIndice();
-            this.#reverseIndex.set(id, jidReal);
+            this.#setIndice(id, jidReal);
             this.#cache.set(id, jidReal);
             return jidReal;
           }
@@ -386,7 +424,7 @@ export class LidResolver {
         continue;
       }
 
-      const fromIndex = this.#reverseIndex.get(id);
+      const fromIndex = this.#getIndice(id);
       if (fromIndex) {
         this.#cache.set(id, fromIndex);
         resultMap.set(id, fromIndex);
@@ -408,7 +446,7 @@ export class LidResolver {
             const jidReal = limpiarJid(pn);
             if (jidReal) {
               this.#limpiarExcesoIndice();
-              this.#reverseIndex.set(lid, jidReal);
+              this.#setIndice(lid, jidReal);
               this.#cache.set(lid, jidReal);
               resultMap.set(lid, jidReal);
             }
@@ -456,6 +494,10 @@ export class LidResolver {
   }
 
   destroy() {
+    if (this.#purgeInterval) {
+      clearInterval(this.#purgeInterval);
+      this.#purgeInterval = null;
+    }
     this.#cache.destroy();
     this.#reverseIndex.clear();
     this.#sock.ev.off("contacts.upsert", this.#handler);
@@ -471,4 +513,5 @@ export class LidResolver {
     this.#joinCallbacks = [];
   }
                                     }
-                            
+
+      
