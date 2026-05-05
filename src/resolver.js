@@ -30,6 +30,7 @@ export class LidResolver {
   #historyHandler;
   #groupParticipantHandler;
   #groupsUpsertHandler;
+  #groupJoinRequestHandler;
   #maxIndexSize;
   #sincronizado = false;
 
@@ -120,6 +121,27 @@ export class LidResolver {
       }
     };
 
+    this.#groupJoinRequestHandler = ({ author, authorPn, participant, participantPn }) => {
+        const nuevosPares = [];
+        if (author && authorPn) {
+          const jid = limpiarJid(authorPn);
+          if (esLid(author) && jid) nuevosPares.push({ lid: author, pn: jid });
+        }
+        if (participant && participantPn) {
+          const jid = limpiarJid(participantPn);
+          if (esLid(participant) && jid) nuevosPares.push({ lid: participant, pn: jid });
+        }
+        
+        if (nuevosPares.length > 0) {
+          for (const { lid, pn } of nuevosPares) {
+            this.#reverseIndex.set(lid, pn);
+            this.#cache.set(lid, pn);
+          }
+          this.#limpiarExcesoIndice();
+          this.#guardarEnSignalRepository(nuevosPares);
+        }
+      };
+
     this.#groupsUpsertHandler = (groups) => {
       if (!Array.isArray(groups)) return;
       for (const group of groups) {
@@ -140,13 +162,15 @@ export class LidResolver {
     this.#sock.ev.on("lid-mapping.update", this.#lidMappingHandler);
     this.#sock.ev.on("messaging-history.set", this.#historyHandler);
     this.#sock.ev.on("group-participants.update", this.#groupParticipantHandler);
+    this.#sock.ev.on("group.join-request", this.#groupJoinRequestHandler);
     this.#sock.ev.on("groups.upsert", this.#groupsUpsertHandler);
+    this.#sock.ev.on("groups.update", this.#groupsUpsertHandler);
   }
 
   #guardarEnSignalRepository(pares) {
     try {
       if (this.#sock.signalRepository?.lidMapping?.storeLIDPNMappings) {
-        this.#sock.signalRepository.lidMapping.storeLIDPNMappings(pares);
+        this.#sock.signalRepository.lidMapping.storeLIDPNMappings(pares).catch(() => {});
       }
     } catch (e) {
     }
@@ -336,6 +360,8 @@ export class LidResolver {
     this.#sock.ev.off("lid-mapping.update", this.#lidMappingHandler);
     this.#sock.ev.off("messaging-history.set", this.#historyHandler);
     this.#sock.ev.off("group-participants.update", this.#groupParticipantHandler);
+    this.#sock.ev.off("group.join-request", this.#groupJoinRequestHandler);
     this.#sock.ev.off("groups.upsert", this.#groupsUpsertHandler);
+    this.#sock.ev.off("groups.update", this.#groupsUpsertHandler);
   }
 }
