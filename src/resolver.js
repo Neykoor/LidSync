@@ -436,4 +436,5 @@ export class LidResolver {
     this.#sock.ev.off("groups.upsert", this.#groupsUpsertHandler);
     this.#sock.ev.off("groups.update", this.#groupsUpsertHandler);
   }
-}
+          }
+          
